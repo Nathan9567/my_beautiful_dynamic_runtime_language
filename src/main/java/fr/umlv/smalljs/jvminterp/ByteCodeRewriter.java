@@ -1,14 +1,11 @@
 package fr.umlv.smalljs.jvminterp;
 
-import static java.lang.invoke.MethodType.genericMethodType;
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.objectweb.asm.Opcodes.ACC_PUBLIC;
-import static org.objectweb.asm.Opcodes.ACC_STATIC;
-import static org.objectweb.asm.Opcodes.ACC_SUPER;
-import static org.objectweb.asm.Opcodes.ARETURN;
-import static org.objectweb.asm.Opcodes.ASTORE;
-import static org.objectweb.asm.Opcodes.H_INVOKESTATIC;
-import static org.objectweb.asm.Opcodes.V21;
+import fr.umlv.smalljs.ast.Expr;
+import fr.umlv.smalljs.ast.Expr.*;
+import fr.umlv.smalljs.rt.Failure;
+import fr.umlv.smalljs.rt.JSObject;
+import org.objectweb.asm.*;
+import org.objectweb.asm.util.CheckClassAdapter;
 
 import java.io.PrintWriter;
 import java.lang.invoke.CallSite;
@@ -19,42 +16,39 @@ import java.lang.invoke.MethodType;
 import java.util.List;
 import java.util.Map;
 
-import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassWriter;
-import org.objectweb.asm.ConstantDynamic;
-import org.objectweb.asm.Handle;
-import org.objectweb.asm.MethodVisitor;
-import org.objectweb.asm.util.CheckClassAdapter;
-
-import fr.umlv.smalljs.ast.Expr;
-import fr.umlv.smalljs.ast.Expr.Block;
-import fr.umlv.smalljs.ast.Expr.Call;
-import fr.umlv.smalljs.ast.Expr.FieldAccess;
-import fr.umlv.smalljs.ast.Expr.FieldAssignment;
-import fr.umlv.smalljs.ast.Expr.Fun;
-import fr.umlv.smalljs.ast.Expr.Identifier;
-import fr.umlv.smalljs.ast.Expr.If;
-import fr.umlv.smalljs.ast.Expr.Literal;
-import fr.umlv.smalljs.ast.Expr.MethodCall;
-import fr.umlv.smalljs.ast.Expr.ObjectLiteral;
-import fr.umlv.smalljs.ast.Expr.Return;
-import fr.umlv.smalljs.ast.Expr.VarAssignment;
-import fr.umlv.smalljs.rt.JSObject;
+import static java.lang.invoke.MethodType.genericMethodType;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.objectweb.asm.Opcodes.*;
 
 public final class ByteCodeRewriter {
+  private static final String JSOBJECT = JSObject.class.getName().replace('.', '/');
+  private static final String RT_NAME = RT.class.getName().replace('.', '/');
+  private static final Handle BSM_UNDEFINED = bsm("bsm_undefined", Object.class, Lookup.class, String.class, Class.class);
+  private static final Handle BSM_CONST = bsm("bsm_const", Object.class, Lookup.class, String.class, Class.class, int.class);
+  private static final Handle BSM_FUNCALL = bsm("bsm_funcall", CallSite.class, Lookup.class, String.class, MethodType.class);
+  private static final Handle BSM_GLOBALCALL = bsm("bsm_globalcall", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
+  private static final Handle BSM_LOOKUP = bsm("bsm_lookup", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
+  private static final Handle BSM_FUN = bsm("bsm_fun", Object.class, Lookup.class, String.class, Class.class, int.class);
+  private static final Handle BSM_REGISTER = bsm("bsm_register", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
+  private static final Handle BSM_TRUTH = bsm("bsm_truth", CallSite.class, Lookup.class, String.class, MethodType.class);
+  private static final Handle BSM_GET = bsm("bsm_get", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
+  private static final Handle BSM_SET = bsm("bsm_set", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
+  private static final Handle BSM_METHODCALL = bsm("bsm_methodcall", CallSite.class, Lookup.class, String.class, MethodType.class);
+
   static JSObject createFunction(String name, List<String> parameters, Block body, JSObject global) {
     var env = JSObject.newEnv(null);
 
     env.register("this", 0);
     for (String parameter : parameters) {
-        env.register(parameter, env.length());
+      env.register(parameter, env.length());
     }
     var parameterCount = env.length();
     visitVariable(body, env);
     var localVariableCount = env.length();
 
     var cv = new ClassWriter(ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
-    cv.visit(V21, ACC_PUBLIC | ACC_SUPER, "script", null, "java/lang/Object", null);
+    cv.visit(V25, ACC_PUBLIC | ACC_SUPER, "script", null, "java/lang/Object",
+        null);
     cv.visitSource("script", null);
 
     var methodType = genericMethodType(1 + parameters.size());
@@ -63,7 +57,7 @@ public final class ByteCodeRewriter {
     mv.visitCode();
 
     //initialize local variables to undefined by default
-    for(var i = parameterCount; i < localVariableCount; i++) {
+    for (var i = parameterCount; i < localVariableCount; i++) {
       mv.visitLdcInsn(new ConstantDynamic("undefined", "Ljava/lang/Object;", BSM_UNDEFINED));
       mv.visitVarInsn(ASTORE, i);
     }
@@ -84,9 +78,9 @@ public final class ByteCodeRewriter {
 
     MethodHandle mh;
     try {
-        mh = MethodHandles.lookup().findStatic(type, name, methodType);
+      mh = MethodHandles.lookup().findStatic(type, name, methodType);
     } catch (NoSuchMethodException | IllegalAccessException e) {
-        throw new AssertionError(e);
+      throw new AssertionError(e);
     }
 
     return JSObject.newFunction(name, mh);
@@ -113,115 +107,156 @@ public final class ByteCodeRewriter {
         visitVariable(trueBlock, env);
         visitVariable(falseBlock, env);
       }
-      case Literal _, Call _, Identifier _, Fun _, Return _, ObjectLiteral _, FieldAccess _,
+      case Literal _, Call _, Identifier _, Fun _, Return _, ObjectLiteral _,
+           FieldAccess _,
            FieldAssignment _, MethodCall _ -> {
         // do nothing
       }
-    };
+    }
   }
 
   private static Handle bsm(String name, Class<?> returnType, Class<?>... parameterTypes) {
-      return new Handle(H_INVOKESTATIC,
-              RT_NAME, name,
-              MethodType.methodType(returnType, parameterTypes).toMethodDescriptorString(), false);
+    return new Handle(H_INVOKESTATIC,
+        RT_NAME, name,
+        MethodType.methodType(returnType, parameterTypes).toMethodDescriptorString(), false);
   }
 
-  private static final String JSOBJECT = JSObject.class.getName().replace('.', '/');
-  private static final String RT_NAME = RT.class.getName().replace('.', '/');
-  private static final Handle BSM_UNDEFINED = bsm("bsm_undefined", Object.class, Lookup.class, String.class, Class.class);
-  private static final Handle BSM_CONST = bsm("bsm_const", Object.class, Lookup.class, String.class, Class.class, int.class);
-  private static final Handle BSM_FUNCALL = bsm("bsm_funcall", CallSite.class, Lookup.class, String.class, MethodType.class);
-  private static final Handle BSM_GLOBALCALL = bsm("bsm_globalcall", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
-  private static final Handle BSM_LOOKUP = bsm("bsm_lookup", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
-  private static final Handle BSM_FUN = bsm("bsm_fun", Object.class, Lookup.class, String.class, Class.class, int.class);
-  private static final Handle BSM_REGISTER = bsm("bsm_register", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
-  private static final Handle BSM_TRUTH = bsm("bsm_truth", CallSite.class, Lookup.class, String.class, MethodType.class);
-  private static final Handle BSM_GET = bsm("bsm_get", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
-  private static final Handle BSM_SET = bsm("bsm_set", CallSite.class, Lookup.class, String.class, MethodType.class, String.class);
-  private static final Handle BSM_METHODCALL = bsm("bsm_methodcall", CallSite.class, Lookup.class, String.class, MethodType.class);
-
   private static void visit(Expr expression, JSObject env, MethodVisitor mv, FunDictionary dictionary) {
-    switch(expression) {
+    switch (expression) {
       case Block(List<Expr> exprs, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO Block");
         // for each expression
-        // generate line numbers
-        // visit it
-        // if not a statement, generate a POP
+        for (var expr : exprs) {
+          // generate line numbers
+          var label = new Label();
+          mv.visitLabel(label);
+          mv.visitLineNumber(lineNumber, label);
+          // visit it
+          visit(expr, env, mv, dictionary);
+          // if not a statement, generate a POP
+          if (!(expr instanceof Expr.Statement)) {
+            mv.visitInsn(POP);
+          }
+        }
       }
       case Literal(Integer integer, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO Literal Integer");
         // use visitLDCInstr with a ConstantDynamic because the JVM does not support Integer (but supports int)
+        mv.visitLdcInsn(new ConstantDynamic("const", "Ljava/lang/Object;", BSM_CONST, integer));
       }
       case Literal(String s, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO Literal String");
         // use visitLDCInstr because the JVM natively supports strings
+        mv.visitLdcInsn(s);
       }
       case Literal _ -> {  // should be UNDEFINED
-        throw new UnsupportedOperationException("TODO Literal UNDEFINED");
         // use visitLDCInstr with a ConstantDynamic because the JVM does not support UNDEFINED natively
+        mv.visitLdcInsn(new ConstantDynamic("undefined", "Ljava/lang/Object;", BSM_UNDEFINED));
       }
       case Call(Expr qualifier, List<Expr> args, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO Call");
         // visit the qualifier
+        visit(qualifier, env, mv, dictionary);
         // load "this"
+        mv.visitLdcInsn(new ConstantDynamic("undefined", "Ljava/lang/Object;", BSM_UNDEFINED));
         // for each argument, visit it
+        for (var arg : args) {
+          visit(arg, env, mv, dictionary);
+        }
         // generate an invokedynamic
+        var desc = "(" + "Ljava/lang/Object;".repeat(2 + args.size()) + ")Ljava/lang/Object;";
+        mv.visitInvokeDynamicInsn("funcall", desc, BSM_FUNCALL);
       }
-      case VarAssignment(String name, Expr expr, boolean declaration, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO VarAssignment");
+      case VarAssignment(
+          String name, Expr expr, boolean declaration, int lineNumber
+      ) -> {
         // visit the expression
+        visit(expr, env, mv, dictionary);
         // lookup that name in the environment
+        var slot = env.lookupOrDefault(name, null);
         // if it does not exist throw a Failure
+        if (slot == null) {
+          throw new Failure("variable " + name + " does not exist");
+        }
         // otherwise STORE the top of the stack at the local variable slot
+        mv.visitVarInsn(ASTORE, (int) slot);
       }
       case Identifier(String name, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO Identifier");
         // lookup to find if it's a local var access or a lookup access
+        var slot = env.lookupOrDefault(name, null);
         // if it does not exist
-        //  generate an invokedynamic doing a lookup
-        // otherwise
-        //  load the local variable at the slot
+        if (slot == null) {
+          //  generate an invokedynamic doing a lookup
+          mv.visitInvokeDynamicInsn("lookup", "()Ljava/lang/Object;", BSM_LOOKUP, name);
+        } else { // otherwise
+          //  load the local variable at the slot
+          mv.visitVarInsn(ALOAD, (int) slot);
+        }
       }
       case Fun fun -> {
         var name = fun.name();
         var toplevel = fun.toplevel();
-        throw new UnsupportedOperationException("TODO Fun");
-        // register the fun inside the fun directory and get the corresponding id
+        // register the fun inside the fun dictionnary and get the corresponding id
+        var id = dictionary.register(fun);
         // emit a LDC to load the function corresponding to the id at runtime
+        mv.visitLdcInsn(new ConstantDynamic(name, "Ljava/lang/Object;", BSM_FUN, id));
         // generate an invokedynamic doing a register with the function name if it's a toplevel
+        if (toplevel) {
+          mv.visitInsn(DUP);
+          mv.visitInvokeDynamicInsn("register", "(Ljava/lang/Object;)V",
+              BSM_REGISTER, name);
+        }
       }
       case Return(Expr expr, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO Return");
         // visit the return expression
+        visit(expr, env, mv, dictionary);
         // generate the bytecode
+        mv.visitInsn(ARETURN);
       }
-      case If(Expr condition, Block trueBlock, Block falseBlock, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO If");
+      case If(
+          Expr condition, Block trueBlock, Block falseBlock, int lineNumber
+      ) -> {
         // visit the condition
+        visit(condition, env, mv, dictionary);
         // generate an invokedynamic to transform an Object to a boolean using BSM_TRUTH
+        mv.visitInvokeDynamicInsn("truth", "(Ljava/lang/Object;)Z", BSM_TRUTH);
+        var elseLabel = new Label();
+        mv.visitJumpInsn(IFEQ, elseLabel);
         // visit the true block
+        visit(trueBlock, env, mv, dictionary);
+        var endLabel = new Label();
+        mv.visitJumpInsn(GOTO, endLabel);
         // visit the false block
+        mv.visitLabel(elseLabel);
+        visit(falseBlock, env, mv, dictionary);
+        mv.visitLabel(endLabel);
       }
       case ObjectLiteral(Map<String, Expr> initMap, int lineNumber) -> {
-        throw new UnsupportedOperationException("TODO ObjectLiteral");
         // call newObject with an INVOKESTATIC
+        mv.visitInsn(ACONST_NULL);
+        mv.visitMethodInsn(INVOKESTATIC, JSOBJECT, "newObject", "(Ljava/lang/Object;)Ljava/lang/Object;", false);
         // for each initialization expression
+        initMap.forEach((key, init) -> {
+          mv.visitInsn(DUP);
           // generate a string with the key
+          mv.visitLdcInsn(key);
+          visit(init, env, mv, dictionary);
           // call register on the JSObject
+          mv.visitMethodInsn(INVOKEVIRTUAL, JSOBJECT, "register", "(Ljava/lang/String;Ljava/lang/Object;)V", false);
+        });
       }
       case FieldAccess(Expr receiver, String name, int lineNumber) -> {
         throw new UnsupportedOperationException("TODO FieldAccess");
         // visit the receiver
         // generate an invokedynamic that goes a get through BSM_GET
       }
-      case FieldAssignment(Expr receiver, String name, Expr expr, int lineNumber) -> {
+      case FieldAssignment(
+          Expr receiver, String name, Expr expr, int lineNumber
+      ) -> {
         throw new UnsupportedOperationException("TODO FieldAssignment");
         // visit the receiver
         // visit the expression
         // generate an invokedynamic that goes a set through BSM_SET
       }
-      case MethodCall(Expr receiver, String name, List<Expr> args, int lineNumber) -> {
+      case MethodCall(
+          Expr receiver, String name, List<Expr> args, int lineNumber
+      ) -> {
         throw new UnsupportedOperationException("TODO MethodCall");
         // visit the receiver
         // for each argument
